@@ -1,0 +1,132 @@
+-- Crear base de datos y usuario (ajusta contraseñas según tu entorno)
+CREATE DATABASE IF NOT EXISTS club_dama
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_spanish_ci;
+
+USE club_dama;
+
+-- Tablas
+DROP TABLE IF EXISTS reservas;
+DROP TABLE IF EXISTS pistas;
+DROP TABLE IF EXISTS socios;
+
+CREATE TABLE socios (
+  id_socio    VARCHAR(36)  NOT NULL,
+  dni         VARCHAR(16)  NOT NULL,
+  nombre      VARCHAR(80)  NOT NULL,
+  apellidos   VARCHAR(120) NOT NULL,
+  telefono    VARCHAR(20),
+  email       VARCHAR(120),
+  CONSTRAINT pk_socios PRIMARY KEY (id_socio),
+  CONSTRAINT uq_socios_dni UNIQUE (dni),
+  CONSTRAINT uq_socios_email UNIQUE (email)
+) ENGINE=InnoDB;
+
+CREATE TABLE pistas (
+  id_pista    VARCHAR(36)  NOT NULL,
+  deporte     ENUM('tenis','pádel','fútbol sala') NOT NULL,
+  descripcion VARCHAR(200),
+  disponible  BOOLEAN NOT NULL DEFAULT TRUE,
+  CONSTRAINT pk_pistas PRIMARY KEY (id_pista)
+) ENGINE=InnoDB;
+
+CREATE TABLE reservas (
+  id_reserva   VARCHAR(36) NOT NULL,
+  id_socio     VARCHAR(36) NOT NULL,
+  id_pista     VARCHAR(36) NOT NULL,
+  fecha        DATE        NOT NULL,
+  hora_inicio  TIME        NOT NULL,
+  duracion_min INT         NOT NULL CHECK (duracion_min > 0),
+  precio       DECIMAL(8,2) NOT NULL CHECK (precio >= 0),
+  CONSTRAINT pk_reservas PRIMARY KEY (id_reserva),
+  CONSTRAINT fk_reservas_socio FOREIGN KEY (id_socio) REFERENCES socios(id_socio)
+    ON UPDATE CASCADE ON DELETE RESTRICT,
+  CONSTRAINT fk_reservas_pista FOREIGN KEY (id_pista) REFERENCES pistas(id_pista)
+    ON UPDATE CASCADE ON DELETE RESTRICT
+) ENGINE=InnoDB;
+
+-- Índices útiles para reglas de negocio y consultas de solapes
+CREATE INDEX ix_reservas_pista_fecha ON reservas(id_pista, fecha, hora_inicio);
+CREATE INDEX ix_reservas_socio_fecha ON reservas(id_socio, fecha);
+
+-- Función opcional para calcular precio (p. ej., a 6 € cada 30 min)
+DELIMITER //
+CREATE OR REPLACE FUNCTION fn_precio_reserva(minutos INT)
+RETURNS DECIMAL(8,2)
+DETERMINISTIC
+BEGIN
+  DECLARE tramos INT;
+  SET tramos = CEIL(minutos / 30);
+  RETURN tramos * 6.00;
+END//
+DELIMITER ;
+
+-- Procedimiento almacenado que valida disponibilidad y crea la reserva
+-- Regla: la pista debe estar operativa y no puede haber solape.
+-- El solape se comprueba en la misma fecha cuando el intervalo [inicio, fin) interseca.
+DELIMITER //
+CREATE OR REPLACE PROCEDURE sp_crear_reserva(
+    IN p_id_reserva VARCHAR(36),
+    IN p_id_socio   VARCHAR(36),
+    IN p_id_pista   VARCHAR(36),
+    IN p_fecha      DATE,
+    IN p_hora_ini   TIME,
+    IN p_duracion   INT
+)
+BEGIN
+    DECLARE v_disponible BOOLEAN;
+    DECLARE v_fin TIME;
+    DECLARE v_precio DECIMAL(8,2);
+
+    IF p_duracion <= 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La duración debe ser > 0';
+    END IF;
+
+    -- Comprobar pista operativa
+    SELECT disponible INTO v_disponible
+    FROM pistas WHERE id_pista = p_id_pista;
+    IF v_disponible IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Pista inexistente';
+    END IF;
+    IF v_disponible = FALSE THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Pista no operativa';
+    END IF;
+
+    -- Calcular fin
+    SET v_fin = ADDTIME(p_hora_ini, SEC_TO_TIME(p_duracion * 60));
+
+    -- Comprobar solape en misma fecha (intervalo cerrado-abierto)
+    IF EXISTS (
+        SELECT 1 FROM reservas r
+        WHERE r.id_pista = p_id_pista
+          AND r.fecha = p_fecha
+          AND (
+                (p_hora_ini < ADDTIME(r.hora_inicio, SEC_TO_TIME(r.duracion_min*60)))
+                AND
+                (v_fin > r.hora_inicio)
+              )
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Solape de reservas en esa pista';
+    END IF;
+
+    -- Calcular precio (usa función opcional)
+    SET v_precio = fn_precio_reserva(p_duracion);
+
+    INSERT INTO reservas(id_reserva, id_socio, id_pista, fecha, hora_inicio, duracion_min, precio)
+    VALUES (p_id_reserva, p_id_socio, p_id_pista, p_fecha, p_hora_ini, p_duracion, v_precio);
+END//
+DELIMITER ;
+
+
+
+-- Datos de ejemplo
+INSERT INTO socios(id_socio, dni, nombre, apellidos, telefono, email) VALUES
+('S-001','12345678A','Ana','López','600111222','ana@example.com'),
+('S-002','87654321B','Luis','García','600333444','luis@example.com');
+
+INSERT INTO pistas(id_pista, deporte, descripcion, disponible) VALUES
+('P-001','tenis','Tenis exterior', TRUE),
+('P-002','pádel','Pádel cubierto', TRUE),
+('P-003','fútbol sala','Pabellón', FALSE);
+
+COMMIT;
